@@ -420,6 +420,7 @@ struct jl_noaliascache_t {
         MDNode *stack = nullptr;          // Stack slot
         MDNode *data = nullptr;           // Any user data that `pointerset/ref` are allowed to alias
         MDNode *constant = nullptr;       // Memory that is immutable by the time LLVM can see it
+        MDNode *coverage = nullptr;       // Coverage and malloc-log counters
 
         jl_regions_t() = default;
 
@@ -431,6 +432,7 @@ struct jl_noaliascache_t {
             this->stack = mbuilder.createAliasScope("jnoalias_stack", domain);
             this->data = mbuilder.createAliasScope("jnoalias_data", domain);
             this->constant = mbuilder.createAliasScope("jnoalias_const", domain);
+            this->coverage = mbuilder.createAliasScope("jnoalias_coverage", domain);
         }
     } regions;
 
@@ -1699,7 +1701,7 @@ static void union_alloca_type(jl_uniontype_t *ut,
 //    '!tbaa' metadata from the jl_tbaacache_t tree.
 namespace {
 struct jl_aliasinfo_t {
-    enum class Region { unknown, gcframe, stack, data, constant }; // See jl_regions_t
+    enum class Region { unknown, gcframe, stack, data, constant, coverage }; // See jl_regions_t
 
     MDNode *tbaa = nullptr;          // '!tbaa': Struct-path TBAA. TBAA graph forms a tree (indexed by offset).
                                      //          Two pointers do not alias if they are not transitive parents
@@ -1790,6 +1792,8 @@ struct jl_aliascache_t {
     jl_aliasinfo_t memoryown;     // The owner in a foreign jl_genericmemory_t
     // Region::constant
     jl_aliasinfo_t constant;      // Memory that is immutable by the time LLVM can see it
+    // Region::coverage
+    jl_aliasinfo_t coverage;      // Coverage and malloc-log counters
 
     bool initialized = false;
     void initialize(jl_codectx_t &ctx);
@@ -2200,23 +2204,26 @@ jl_aliasinfo_t::jl_aliasinfo_t(jl_codectx_t &ctx, Region r, MDNode *tbaa): tbaa(
         case Region::constant:
             alias_scope = regions.constant;
             break;
+        case Region::coverage:
+            alias_scope = regions.coverage;
+            break;
     }
 
-    MDNode *all_scopes[4] = { regions.gcframe, regions.stack, regions.data, regions.constant };
+    MDNode *all_scopes[] = { regions.gcframe, regions.stack, regions.data, regions.constant,
+                             regions.coverage };
     if (alias_scope) {
         // The matching region is added to !alias.scope
         // All other regions are added to !noalias
 
-        int i = 0;
-        Metadata *scopes[1] = { alias_scope };
-        Metadata *noaliases[3];
-        for (auto const &scope: all_scopes) {
+        SmallVector<Metadata *, 4> noaliases;
+        for (MDNode *scope : all_scopes) {
             if (scope == alias_scope) continue;
-            noaliases[i++] = scope;
+            noaliases.push_back(scope);
         }
 
+        Metadata *scopes[1] = { alias_scope };
         this->scope = MDNode::get(ctx.builder.getContext(), ArrayRef<Metadata*>(scopes));
-        this->noalias = MDNode::get(ctx.builder.getContext(), ArrayRef<Metadata*>(noaliases));
+        this->noalias = MDNode::get(ctx.builder.getContext(), noaliases);
     }
 }
 
@@ -2266,6 +2273,7 @@ void jl_aliascache_t::initialize(jl_codectx_t &ctx)
     memorylen = jl_aliasinfo_t(ctx, Region::data, tbaa.tbaa_memorylen);
     memoryown = jl_aliasinfo_t(ctx, Region::data, tbaa.tbaa_memoryown);
     constant = jl_aliasinfo_t(ctx, Region::constant, tbaa.tbaa_const);
+    coverage = jl_aliasinfo_t(ctx, Region::coverage, tbaa.tbaa_coverage);
 }
 
 // Alias info for the inline data of an `sret` return buffer. Both the caller
@@ -3320,23 +3328,25 @@ static std::pair<bool, bool> uses_specsig(jl_value_t *abi, jl_method_instance_t 
 static void visitLine(jl_codectx_t &ctx, Value *pv, Value *addend, const char *name, bool hit_only)
 {
     // Separate accesses avoid the atomic RMW overhead reported in #62424.
-    // Unordered accesses can be promoted out of loops, while TBAA keeps them
-    // from blocking optimizations of program memory.
+    // Unordered accesses can be promoted out of loops, while the counters'
+    // own alias region and TBAA tag keep them from blocking optimizations of
+    // program memory.
+    jl_aliasinfo_t ai = ctx.alias().coverage;
     if (hit_only) {
         // Racing stores are harmless because hit mode records only zero or one.
         StoreInst *s = ctx.builder.CreateAlignedStore(
             ConstantInt::get(getInt64Ty(ctx.builder.getContext()), 1), pv, Align(8));
         s->setOrdering(AtomicOrdering::Unordered);
-        s->setMetadata(LLVMContext::MD_tbaa, ctx.tbaa().tbaa_coverage);
+        ai.decorateInst(s);
         return;
     }
     LoadInst *v = ctx.builder.CreateAlignedLoad(getInt64Ty(ctx.builder.getContext()), pv, Align(8), name);
     v->setOrdering(AtomicOrdering::Unordered);
-    v->setMetadata(LLVMContext::MD_tbaa, ctx.tbaa().tbaa_coverage);
+    ai.decorateInst(v);
     Value *sum = ctx.builder.CreateAdd(v, addend);
     StoreInst *s = ctx.builder.CreateAlignedStore(sum, pv, Align(8));
     s->setOrdering(AtomicOrdering::Unordered);
-    s->setMetadata(LLVMContext::MD_tbaa, ctx.tbaa().tbaa_coverage);
+    ai.decorateInst(s);
 }
 
 // Code coverage
