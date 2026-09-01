@@ -90,6 +90,72 @@ function Base.floor(t::Time, p::TimePeriod)
     return Time(Nanosecond(nanoseconds - mod(nanoseconds, value(Nanosecond(p)))))
 end
 
+const TIMESTAMP_ROUNDING_EPOCH_NS = Int128(UNIXEPOCHDAYS - DATEEPOCH) * NS_PER_DAY
+
+_timestamp_rata_ns(days) = (Int128(days) - UNIXEPOCHDAYS) * NS_PER_DAY
+
+function _timestamp_month_ns(months)
+    y, m = fldmod(months, 12)
+    return _timestamp_rata_ns(totaldays(y, Int64(m + 1), 1))
+end
+
+function _timestamp_floorceil_ns(dt::Timestamp, p::TimePeriod)
+    value(p) < 1 && throw(DomainError(p))
+    step = _timestamp_ns(p)
+    nanoseconds = Int128(value(dt)) + TIMESTAMP_ROUNDING_EPOCH_NS
+    f = nanoseconds - mod(nanoseconds, step) - TIMESTAMP_ROUNDING_EPOCH_NS
+    return f, f == value(dt) ? f : f + step
+end
+
+function _timestamp_floorceil_ns(dt::Timestamp, p::Year)
+    value(p) < 1 && throw(DomainError(p))
+    step = Int128(value(p))
+    y = Int128(year(dt))
+    fy = y - mod(y, step)
+    f = _timestamp_rata_ns(totaldays(fy, 1, 1))
+    c = f == value(dt) ? f : _timestamp_rata_ns(totaldays(fy + step, 1, 1))
+    return f, c
+end
+
+function _timestamp_floorceil_month_ns(dt::Timestamp, step)
+    months = Int128(year(dt)) * 12 + month(dt) - 1
+    fm = months - mod(months, step)
+    f = _timestamp_month_ns(fm)
+    return f, f == value(dt) ? f : _timestamp_month_ns(fm + step)
+end
+
+function _timestamp_floorceil_ns(dt::Timestamp, p::Month)
+    value(p) < 1 && throw(DomainError(p))
+    return _timestamp_floorceil_month_ns(dt, Int128(value(p)))
+end
+
+function _timestamp_floorceil_ns(dt::Timestamp, p::Quarter)
+    value(p) < 1 && throw(DomainError(p))
+    return _timestamp_floorceil_month_ns(dt, Int128(value(p)) * 3)
+end
+
+function _timestamp_floorceil_day_ns(dt::Timestamp, step, epoch)
+    current = Int128(days(dt))
+    fd = current - mod(current - epoch, step)
+    f = _timestamp_rata_ns(fd)
+    return f, f == value(dt) ? f : _timestamp_rata_ns(fd + step)
+end
+
+function _timestamp_floorceil_ns(dt::Timestamp, p::Week)
+    value(p) < 1 && throw(DomainError(p))
+    return _timestamp_floorceil_day_ns(dt, Int128(value(p)) * 7, WEEKEPOCH)
+end
+
+function _timestamp_floorceil_ns(dt::Timestamp, p::Day)
+    value(p) < 1 && throw(DomainError(p))
+    return _timestamp_floorceil_day_ns(dt, Int128(value(p)), DATEEPOCH)
+end
+
+function Base.floor(dt::Timestamp, p::Period)
+    f, _ = _timestamp_floorceil_ns(dt, p)
+    return _timestamp_from_ns(f)
+end
+
 """
     floor(x::Period, precision::T) where T <: Union{TimePeriod, Week, Day} -> T
 
@@ -122,7 +188,8 @@ end
 """
     floor(dt::TimeType, p::Period)::TimeType
 
-Return the nearest `Date` or `DateTime` less than or equal to `dt` at resolution `p`.
+Return the nearest `Date`, `DateTime`, or `Timestamp` less than or equal to `dt`
+at resolution `p`.
 
 For convenience, `p` may be a type instead of a value: `floor(dt, Dates.Hour)` is a shortcut
 for `floor(dt, Dates.Hour(1))`.
@@ -143,7 +210,8 @@ Base.floor(::Dates.TimeType, ::Dates.Period)
 """
     ceil(dt::TimeType, p::Period)::TimeType
 
-Return the nearest `Date` or `DateTime` greater than or equal to `dt` at resolution `p`.
+Return the nearest `Date`, `DateTime`, or `Timestamp` greater than or equal to
+`dt` at resolution `p`.
 
 For convenience, `p` may be a type instead of a value: `ceil(dt, Dates.Hour)` is a shortcut
 for `ceil(dt, Dates.Hour(1))`.
@@ -162,6 +230,11 @@ julia> ceil(DateTime(2016, 8, 6, 12, 0, 0), Day)
 function Base.ceil(dt::TimeType, p::Period)
     f = floor(dt, p)
     return (dt == f) ? f : f + p
+end
+
+function Base.ceil(dt::Timestamp, p::Period)
+    _, c = _timestamp_floorceil_ns(dt, p)
+    return _timestamp_from_ns(c)
 end
 
 """
@@ -195,12 +268,18 @@ end
 """
     floorceil(dt::TimeType, p::Period) -> (TimeType, TimeType)
 
-Simultaneously return the `floor` and `ceil` of a `Date` or `DateTime` at resolution `p`.
-More efficient than calling both `floor` and `ceil` individually.
+Simultaneously return the `floor` and `ceil` of a `Date`, `DateTime`, or
+`Timestamp` at resolution `p`. More efficient than calling both `floor` and
+`ceil` individually.
 """
 function floorceil(dt::TimeType, p::Period)
     f = floor(dt, p)
     return f, (dt == f) ? f : f + p
+end
+
+function floorceil(dt::Timestamp, p::Period)
+    f, c = _timestamp_floorceil_ns(dt, p)
+    return _timestamp_from_ns(f), _timestamp_from_ns(c)
 end
 
 """
@@ -217,7 +296,7 @@ end
 """
     round(dt::TimeType, p::Period, [r::RoundingMode]) -> TimeType
 
-Return the `Date` or `DateTime` nearest to `dt` at resolution `p`. By default
+Return the `Date`, `DateTime`, or `Timestamp` nearest to `dt` at resolution `p`. By default
 (`RoundNearestTiesUp`), ties (e.g., rounding 9:30 to the nearest hour) will be rounded up.
 
 For convenience, `p` may be a type instead of a value: `round(dt, Dates.Hour)` is a shortcut
@@ -240,6 +319,12 @@ Valid rounding modes for `round(::TimeType, ::Period, ::RoundingMode)` are
 function Base.round(dt::TimeType, p::Period, r::RoundingMode{:NearestTiesUp})
     f, c = floorceil(dt, p)
     return (dt - f) < (c - dt) ? f : c
+end
+
+function Base.round(dt::Timestamp, p::Period, r::RoundingMode{:NearestTiesUp})
+    f, c = _timestamp_floorceil_ns(dt, p)
+    rounded = Int128(value(dt)) - f < c - Int128(value(dt)) ? f : c
+    return _timestamp_from_ns(rounded)
 end
 
 """
