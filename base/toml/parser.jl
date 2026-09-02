@@ -576,12 +576,12 @@ function attach_inline_comment!(l::Parser)
     return
 end
 
-function path_traverses_array(l::Parser, keys::AbstractVector{String})
+function path_traverses_array(l::Parser{Dates, D}, keys::AbstractVector{String}) where {Dates, D}
     d = l.root
     for k in keys
         v = get(d, k, nothing)
         v isa Vector && return true
-        v isa AbstractDict || return false
+        v isa D || return false
         d = v
     end
     return false
@@ -672,10 +672,10 @@ function recurse_dict!(l::Parser{Dates, D}, d::AbstractDict, dotted_keys::Abstra
     return d::D
 end
 
-function check_allowed_add_key(l::Parser, d, check_defined=true)::Err{Nothing}
-    if !(d isa AbstractDict)
+function check_allowed_add_key(l::Parser{Dates, D}, d, check_defined=true)::Err{Nothing} where {Dates, D}
+    if !(d isa D)
         return ParserError(ErrKeyAlreadyHasValue)
-    elseif d isa AbstractDict && d in l.inline_tables
+    elseif d in l.inline_tables
         return ParserError(ErrAddKeyToInlineTable)
     elseif check_defined && d in l.defined_tables
         return ParserError(ErrDuplicatedKey)
@@ -751,7 +751,7 @@ function parse_array_table(l)::Union{Nothing, ParserError}
     return
 end
 
-function parse_entry(l::Parser, d)::Union{Nothing, ParserError}
+function parse_entry(l::Parser{Dates, D}, d)::Union{Nothing, ParserError} where {Dates, D}
     key = @try parse_key(l)
     # `key` aliases `dotted_keys`, which parsing an inline table may overwrite.
     capture_comments = l.comments !== nothing && !(d in l.inline_tables)
@@ -769,7 +769,7 @@ function parse_entry(l::Parser, d)::Union{Nothing, ParserError}
     v = get(d, last_key_part, nothing)
     if v !== nothing
         @try check_allowed_add_key(l, v)
-        if v isa AbstractDict && v in l.implicit_tables
+        if v isa D && v in l.implicit_tables
             return ParserError(ErrDuplicatedKey)
         end
     end
@@ -777,7 +777,7 @@ function parse_entry(l::Parser, d)::Union{Nothing, ParserError}
     skip_ws(l)
     value = @try parse_value(l)
     # Not allowed to overwrite a value with an inline dict
-    if value isa AbstractDict && haskey(d, last_key_part)
+    if value isa D && haskey(d, last_key_part)
         return ParserError(ErrInlineTableRedefine)
     end
     # TODO: Performance, hashing `last_key_part` again here
